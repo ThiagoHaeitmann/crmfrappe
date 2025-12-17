@@ -153,4 +153,4 @@ bench --site "${SITE_NAME}" set-config server_script_enabled "${SERVER_SCRIPT_EN
 bench --site "${SITE_NAME}" clear-cache || true
 bench use "${SITE_NAME}"
 
-exec bench start --port "${HTTP_PORT}" --socketio-port "${SOCKETIO_PORT}"
+exec bench start
