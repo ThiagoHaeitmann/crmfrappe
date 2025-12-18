@@ -12,6 +12,7 @@ ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
 DB_HOST="${DB_HOST:-127.0.0.1}"
 DB_PORT="${DB_PORT:-3306}"
 
+# usuário "admin" do MariaDB que consegue criar DB/user (pode ser root ou teu frappe_crm com ALL)
 DB_ROOT_USERNAME="${DB_ROOT_USERNAME:-root}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-123}"
 
@@ -21,7 +22,7 @@ DB_NAME="${DB_NAME:-}"
 
 REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
 REDIS_PORT="${REDIS_PORT:-6379}"
-REDIS_URL="redis://${REDIS_HOST}:${REDIS_PORT}"
+REDIS_URL="${REDIS_URL:-redis://${REDIS_HOST}:${REDIS_PORT}}"
 
 FRAPPE_BRANCH="${FRAPPE_BRANCH:-version-15}"
 CRM_REPO_URL="${CRM_REPO_URL:-https://github.com/frappe/crm}"
@@ -40,6 +41,8 @@ SOCKETIO_PORT="${SOCKETIO_PORT:-9000}"
 # GxP controls
 GXP_MODE="${GXP_MODE:-1}"
 AUTO_REPAIR_SITE="${AUTO_REPAIR_SITE:-1}"
+
+# se existir qualquer evidência de arquivo/documento, NÃO reseta
 PROTECT_IF_FILES="${PROTECT_IF_FILES:-1}"
 PROTECT_IF_DB_HAS_FILES="${PROTECT_IF_DB_HAS_FILES:-1}"
 
@@ -83,13 +86,12 @@ site_exists() {
 site_has_files_on_disk() {
   local pub="${BENCH_DIR}/sites/${SITE_NAME}/public/files"
   local prv="${BENCH_DIR}/sites/${SITE_NAME}/private/files"
-  if [[ -d "$pub" ]] && find "$pub" -type f -maxdepth 1 2>/dev/null | head -n 1 | grep -q .; then return 0; fi
-  if [[ -d "$prv" ]] && find "$prv" -type f -maxdepth 1 2>/dev/null | head -n 1 | grep -q .; then return 0; fi
+  if [[ -d "$pub" ]] && find "$pub" -maxdepth 1 -type f 2>/dev/null | head -n 1 | grep -q .; then return 0; fi
+  if [[ -d "$prv" ]] && find "$prv" -maxdepth 1 -type f 2>/dev/null | head -n 1 | grep -q .; then return 0; fi
   return 1
 }
 
 db_has_files() {
-  # Só roda se o site estiver minimamente funcional.
   bench --site "${SITE_NAME}" console <<'PY' >/dev/null 2>&1
 import frappe
 frappe.connect()
@@ -100,7 +102,6 @@ PY
 }
 
 core_schema_ok() {
-  # Smoke test: esse import + conexão + existência de tabela core.
   bench --site "${SITE_NAME}" console <<'PY' >/dev/null 2>&1
 import frappe
 frappe.connect()
@@ -118,19 +119,25 @@ wipe_bench_keep_sites_logs() {
 }
 
 bench_recreate_preserving_volumes() {
-  log "Bench missing/broken. Recreating bench (preserve sites/logs) ..."
+  log "Bench missing/broken. Creating bench via TMP and moving into ${BENCH_DIR} (preserve sites/logs mountpoints)..."
+
+  # limpa destino sem tocar nos mountpoints
   wipe_bench_keep_sites_logs
+  ensure_sites_logs
+
   local tmp="/home/frappe/.bench-tmp.$(date +%s).$RANDOM"
   log "bench init at ${tmp}"
   bench init --skip-redis-config-generation "${tmp}" --version "${FRAPPE_BRANCH}"
 
-  log "Syncing bench to ${BENCH_DIR} (excluding sites/logs)..."
-  rsync -a --delete \
-    --exclude 'sites' \
-    --exclude 'logs' \
-    "${tmp}/" "${BENCH_DIR}/"
+  # REMOVE do tmp o que NÃO pode tocar (sites/logs) antes de mover
+  rm -rf "${tmp}/sites" "${tmp}/logs" 2>/dev/null || true
 
+  log "Moving TMP bench into ${BENCH_DIR} (excluding sites/logs)..."
+  shopt -s dotglob
+  mv "${tmp}/"* "${BENCH_DIR}/"
+  shopt -u dotglob
   rm -rf "${tmp}" || true
+
   ensure_sites_logs
 
   if ! bench_ok; then
@@ -141,9 +148,7 @@ bench_recreate_preserving_volumes() {
 
 ensure_db_user_db_exist() {
   log "Ensuring MariaDB database/user exist: db=${DB_NAME} user=${DB_USER}"
-  # usa python padrão do container pra evitar depender de mysql-client
   python3 - <<PY
-import sys
 import pymysql
 
 host="${DB_HOST}"
@@ -158,7 +163,7 @@ conn = pymysql.connect(host=host, port=port, user=root_user, password=root_pass,
 cur = conn.cursor()
 cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
 cur.execute(f"CREATE USER IF NOT EXISTS '{app_user}'@'%' IDENTIFIED BY '{app_pass}'")
-cur.execute(f\"GRANT ALL PRIVILEGES ON `{db}`.* TO '{app_user}'@'%'\")
+cur.execute(f"GRANT ALL PRIVILEGES ON `{db}`.* TO '{app_user}'@'%'")
 cur.execute("FLUSH PRIVILEGES")
 cur.close()
 conn.close()
@@ -167,9 +172,8 @@ PY
 }
 
 hard_reset_site_and_db() {
-  log "AUTO-REPAIR: Recreating site+DB (hard reset)..."
+  log "AUTO-REPAIR: HARD RESET site+DB (no evidence of customer documents found)..."
 
-  # cuidado: isso apaga DB e pastas do site (não apaga logs gerais)
   python3 - <<PY
 import pymysql
 host="${DB_HOST}"; port=int("${DB_PORT}")
@@ -194,7 +198,7 @@ PY
     --db-port "${DB_PORT}" \
     --db-name "${DB_NAME}" \
     --mariadb-user-host-login-scope="%" \
-    --no-mariadb-socket || true
+    --no-mariadb-socket
 }
 
 # ----------------------------
@@ -236,7 +240,7 @@ fi
 cd "${BENCH_DIR}"
 
 # ----------------------------
-# Configure endpoints
+# Configure endpoints (idempotent)
 # ----------------------------
 log "Configuring DB/Redis endpoints..."
 bench set-mariadb-host "${DB_HOST}" || true
@@ -258,13 +262,11 @@ else
 fi
 
 # ----------------------------
-# DB ensure + Site validate/repair (GxP)
+# DB ensure + Site create/validate/repair (GxP)
 # ----------------------------
 ensure_db_user_db_exist
 
-if site_exists; then
-  log "Site ${SITE_NAME} exists."
-else
+if ! site_exists; then
   log "Creating site ${SITE_NAME} (db=${DB_NAME})..."
   bench new-site "${SITE_NAME}" \
     --force \
@@ -276,23 +278,26 @@ else
     --db-name "${DB_NAME}" \
     --mariadb-user-host-login-scope="%" \
     --no-mariadb-socket
+else
+  log "Site ${SITE_NAME} exists."
 fi
 
-# Se core schema tá quebrado: decidir reset automático ou travar (GxP)
+# Se schema core tá quebrado: auto-repair só se NÃO tiver evidência de doc/dado
 if core_schema_ok; then
   log "Core schema OK."
 else
   log "Core schema missing/broken."
+
   if [[ "${AUTO_REPAIR_SITE}" != "1" ]]; then
     log "AUTO_REPAIR_SITE=0 => refusing to repair."
     exit 1
   fi
 
-  # Proteções GxP
   if [[ "${GXP_MODE}" == "1" && "${PROTECT_IF_FILES}" == "1" ]] && site_has_files_on_disk; then
     log "GxP BLOCK: Found files on disk (public/private). Refusing hard reset."
     exit 1
   fi
+
   if [[ "${GXP_MODE}" == "1" && "${PROTECT_IF_DB_HAS_FILES}" == "1" ]]; then
     if db_has_files; then
       log "GxP BLOCK: DB has File records. Refusing hard reset."
@@ -310,7 +315,7 @@ else
 fi
 
 # ----------------------------
-# Enforce DB config (keeps deterministic DB_NAME)
+# Enforce DB config (deterministic)
 # ----------------------------
 bench --site "${SITE_NAME}" set-config db_host "${DB_HOST}" || true
 bench --site "${SITE_NAME}" set-config db_port "${DB_PORT}" || true
