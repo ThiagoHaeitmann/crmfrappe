@@ -61,7 +61,10 @@ is_valid_bench() {
 }
 
 wipe_bench_contents() {
-  find "${BENCH_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    find "${BENCH_DIR}" -mindepth 1 -maxdepth 1 \
+    ! -name "sites" \
+    ! -name "logs" \
+    -exec rm -rf {} +
 }
 
 # lock simples pra impedir init concorrente
