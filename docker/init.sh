@@ -12,11 +12,15 @@ ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
 DB_HOST="${DB_HOST:-127.0.0.1}"
 DB_PORT="${DB_PORT:-3306}"
 
+# usuário com permissão de criar DB (pode ser root OU teu frappe_crm com ALL PRIVILEGES)
 DB_ROOT_USERNAME="${DB_ROOT_USERNAME:-root}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-123}"
 
+# usuário que o site vai usar
 DB_USER="${DB_USER:-frappe_crm}"
 DB_PASSWORD="${DB_PASSWORD:-frappe_crm}"
+
+# se vazio -> deriva do SITE_NAME, se preenchido -> garante que exista
 DB_NAME="${DB_NAME:-}"
 
 REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
@@ -70,6 +74,46 @@ ensure_sites_logs() {
   [[ -f "${BENCH_DIR}/sites/common_site_config.json" ]] || echo "{}" > "${BENCH_DIR}/sites/common_site_config.json"
 }
 
+derive_db_name() {
+  echo "${SITE_NAME}" | tr '.' '_' | tr -cd 'a-zA-Z0-9_'
+}
+
+# cria DB e garante grants pro DB_USER (sem depender de mysql client)
+ensure_db_and_user() {
+  local db="$1"
+
+  log "Ensuring MariaDB database/user exist: db=${db} user=${DB_USER}"
+
+  "${BENCH_DIR}/env/bin/python" - <<PY
+import os, sys
+import pymysql
+
+db_host = os.environ["DB_HOST"]
+db_port = int(os.environ["DB_PORT"])
+root_user = os.environ["DB_ROOT_USERNAME"]
+root_pass = os.environ["DB_ROOT_PASSWORD"]
+
+app_user = os.environ["DB_USER"]
+app_pass = os.environ["DB_PASSWORD"]
+db_name  = os.environ["DB_NAME_EFFECTIVE"]
+
+conn = pymysql.connect(
+  host=db_host, port=db_port,
+  user=root_user, password=root_pass,
+  autocommit=True, charset="utf8mb4"
+)
+
+with conn.cursor() as cur:
+  cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
+  cur.execute(f"CREATE USER IF NOT EXISTS `{app_user}`@`%` IDENTIFIED BY %s;", (app_pass,))
+  cur.execute(f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO `{app_user}`@`%`;")
+  cur.execute("FLUSH PRIVILEGES;")
+
+conn.close()
+print("[init] DB ensured OK")
+PY
+}
+
 # ----------------------------
 # lock
 # ----------------------------
@@ -81,8 +125,9 @@ trap 'rmdir "${LOCKDIR}" 2>/dev/null || true' EXIT
 
 # DB_NAME default
 if [ -z "${DB_NAME}" ]; then
-  DB_NAME="$(echo "${SITE_NAME}" | tr '.' '_' | tr -cd 'a-zA-Z0-9_')"
+  DB_NAME="$(derive_db_name)"
 fi
+export DB_NAME_EFFECTIVE="${DB_NAME}"
 
 log "SITE_NAME=${SITE_NAME}"
 log "DB=${DB_HOST}:${DB_PORT} root=${DB_ROOT_USERNAME} app_user=${DB_USER} db=${DB_NAME}"
@@ -104,12 +149,12 @@ wait_tcp "${DB_HOST}" "${DB_PORT}" "MariaDB"
 ensure_sites_logs
 
 # ----------------------------
-# Create/repair bench
+# Create/repair bench (preserva sites/logs)
 # ----------------------------
 if bench_ok; then
   log "Bench is healthy. Using existing bench."
 else
-  log "Bench missing/broken. Recreating bench (safe copy, exclude sites/logs) ..."
+  log "Bench missing/broken. Recreating bench (preserve sites/logs) ..."
 
   # limpa tudo EXCETO sites/logs
   find "${BENCH_DIR}" -mindepth 1 -maxdepth 1 \
@@ -121,19 +166,17 @@ else
   log "bench init at ${TMP_DIR}"
   bench init --skip-redis-config-generation "${TMP_DIR}" --version "${FRAPPE_BRANCH}"
 
-  # copia tudo pro destino final, mas NÃO toca nos volumes
   log "Syncing bench to ${BENCH_DIR} (excluding sites/logs)..."
   rsync -a --delete \
     --exclude 'sites' \
     --exclude 'logs' \
     "${TMP_DIR}/" "${BENCH_DIR}/"
 
-  # CRÍTICO: conserta editable install (senão import frappe aponta pro TMP)
+  # evita “editable install” apontar pro TMP
   log "Fixing editable install paths in final bench env..."
   "${BENCH_DIR}/env/bin/python" -m pip install --quiet --upgrade -e "${BENCH_DIR}/apps/frappe"
 
   rm -rf "${TMP_DIR}" || true
-
   ensure_sites_logs
 
   if ! bench_ok; then
@@ -145,7 +188,7 @@ fi
 cd "${BENCH_DIR}"
 
 # ----------------------------
-# Configure DB/Redis (idempotent)
+# Config DB/Redis (idempotent)
 # ----------------------------
 log "Configuring DB/Redis endpoints..."
 bench set-mariadb-host "${DB_HOST}" || true
@@ -157,12 +200,12 @@ sed -i '/redis/d' ./Procfile 2>/dev/null || true
 sed -i '/watch/d' ./Procfile 2>/dev/null || true
 
 # ----------------------------
-# App CRM (skip assets here!)
+# App CRM
 # ----------------------------
 if bench list-apps 2>/dev/null | grep -qx 'crm'; then
   log "App crm already installed in bench."
 else
-  log "Getting app crm (skip assets)..."
+  log "Getting app crm..."
   bench get-app crm "${CRM_REPO_URL}" --branch "${CRM_REF}" --skip-assets
 fi
 
@@ -182,7 +225,11 @@ else
     --no-mariadb-socket
 fi
 
-# configs DB app (mantém seu padrão)
+# ✅ GARANTE que o DB_NAME existe ANTES de mexer no site_config / instalar app
+ensure_db_and_user "${DB_NAME}"
+
+# fixa config do site pra usar DB_NAME desejado
+log "Applying DB config into site_config..."
 bench --site "${SITE_NAME}" set-config db_host "${DB_HOST}" || true
 bench --site "${SITE_NAME}" set-config db_port "${DB_PORT}" || true
 bench --site "${SITE_NAME}" set-config db_name "${DB_NAME}" || true
@@ -203,11 +250,8 @@ if [ "${RUN_MIGRATE}" = "1" ]; then
   bench --site "${SITE_NAME}" migrate
 fi
 
-# ----------------------------
-# Build assets LAST (final bench)
-# ----------------------------
 if [ "${RUN_BUILD_ASSETS}" = "1" ]; then
-  log "Building assets (final)..."
+  log "Building assets..."
   bench build --force
 fi
 
