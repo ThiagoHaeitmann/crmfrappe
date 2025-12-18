@@ -158,8 +158,6 @@ bench_recreate_preserving_volumes() {
   fi
 }
 
-}
-
 ensure_db_user_db_exist() {
   log "Ensuring MariaDB database/user exist: db=${DB_NAME} user=${DB_USER}"
   python3 - <<PY
