@@ -119,9 +119,8 @@ wipe_bench_keep_sites_logs() {
 }
 
 bench_recreate_preserving_volumes() {
-  log "Bench missing/broken. Creating bench via TMP and moving into ${BENCH_DIR} (preserve sites/logs mountpoints)..."
+  log "Bench missing/broken. Creating bench via TMP then rebuilding venv in FINAL path..."
 
-  # limpa destino sem tocar nos mountpoints
   wipe_bench_keep_sites_logs
   ensure_sites_logs
 
@@ -129,10 +128,10 @@ bench_recreate_preserving_volumes() {
   log "bench init at ${tmp}"
   bench init --skip-redis-config-generation "${tmp}" --version "${FRAPPE_BRANCH}"
 
-  # REMOVE do tmp o que NÃO pode tocar (sites/logs) antes de mover
-  rm -rf "${tmp}/sites" "${tmp}/logs" 2>/dev/null || true
+  # NÃO copiar/mover env (venv não é relocatable)
+  rm -rf "${tmp}/sites" "${tmp}/logs" "${tmp}/env" 2>/dev/null || true
 
-  log "Moving TMP bench into ${BENCH_DIR} (excluding sites/logs)..."
+  log "Moving TMP bench into ${BENCH_DIR} (excluding sites/logs/env)..."
   shopt -s dotglob
   mv "${tmp}/"* "${BENCH_DIR}/"
   shopt -u dotglob
@@ -140,10 +139,25 @@ bench_recreate_preserving_volumes() {
 
   ensure_sites_logs
 
-  if ! bench_ok; then
-    log "ERROR: bench still broken after recreate."
+  log "Rebuilding Python venv in FINAL bench path..."
+  python3 -m venv "${BENCH_DIR}/env"
+  "${BENCH_DIR}/env/bin/python" -m pip install --quiet --upgrade pip wheel
+
+  # reinstala frappe no venv FINAL (evita path do TMP)
+  "${BENCH_DIR}/env/bin/python" -m pip install --quiet --upgrade -e "${BENCH_DIR}/apps/frappe"
+
+  # sanity check
+  if ! "${BENCH_DIR}/env/bin/python" -c "import frappe" >/dev/null 2>&1; then
+    log "ERROR: venv rebuilt but 'import frappe' still fails."
     exit 1
   fi
+
+  if ! bench_ok; then
+    log "ERROR: bench still broken after venv rebuild."
+    exit 1
+  fi
+}
+
 }
 
 ensure_db_user_db_exist() {
