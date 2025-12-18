@@ -16,6 +16,10 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
  && yarn -v \
  && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg rsync \
+ && rm -rf /var/lib/apt/lists/*
+
 RUN mkdir -p /home/frappe/frappe-bench \
  && chown -R frappe:frappe /home/frappe \
  && chmod -R 0775 /home/frappe/frappe-bench
