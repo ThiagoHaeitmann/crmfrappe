@@ -81,11 +81,10 @@ derive_db_name() {
 # cria DB e garante grants pro DB_USER (sem depender de mysql client)
 ensure_db_and_user() {
   local db="$1"
-
   log "Ensuring MariaDB database/user exist: db=${db} user=${DB_USER}"
 
-  "${BENCH_DIR}/env/bin/python" - <<PY
-import os, sys
+  DB_NAME_EFFECTIVE="${db}" "${BENCH_DIR}/env/bin/python" - <<'PY'
+import os
 import pymysql
 
 db_host = os.environ["DB_HOST"]
@@ -98,16 +97,25 @@ app_pass = os.environ["DB_PASSWORD"]
 db_name  = os.environ["DB_NAME_EFFECTIVE"]
 
 conn = pymysql.connect(
-  host=db_host, port=db_port,
-  user=root_user, password=root_pass,
-  autocommit=True, charset="utf8mb4"
+    host=db_host, port=db_port,
+    user=root_user, password=root_pass,
+    autocommit=True, charset="utf8mb4"
 )
 
+def q_ident(s: str) -> str:
+    # backtick-safe identifier
+    return "`" + s.replace("`", "``") + "`"
+
+def q_str(s: str) -> str:
+    # single-quote-safe literal
+    return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
 with conn.cursor() as cur:
-  cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
-  cur.execute(f"CREATE USER IF NOT EXISTS `{app_user}`@`%` IDENTIFIED BY %s;", (app_pass,))
-  cur.execute(f"GRANT ALL PRIVILEGES ON `{db_name}`.* TO `{app_user}`@`%`;")
-  cur.execute("FLUSH PRIVILEGES;")
+    cur.execute(f"CREATE DATABASE IF NOT EXISTS {q_ident(db_name)} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
+    # MariaDB: CREATE USER IF NOT EXISTS é ok em versões recentes; se não for, o erro você vê no log.
+    cur.execute(f"CREATE USER IF NOT EXISTS {q_ident(app_user)}@'%' IDENTIFIED BY {q_str(app_pass)};")
+    cur.execute(f"GRANT ALL PRIVILEGES ON {q_ident(db_name)}.* TO {q_ident(app_user)}@'%';")
+    cur.execute("FLUSH PRIVILEGES;")
 
 conn.close()
 print("[init] DB ensured OK")
