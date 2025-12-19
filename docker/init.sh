@@ -12,6 +12,8 @@ ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
 DB_HOST="${DB_HOST:-127.0.0.1}"
 DB_PORT="${DB_PORT:-3306}"
 
+# IMPORTANTE:
+# - Esse "root" aqui precisa conseguir criar DB (CREATE DATABASE). Nós NÃO vamos mais criar usuário.
 DB_ROOT_USERNAME="${DB_ROOT_USERNAME:-root}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-123}"
 
@@ -20,8 +22,14 @@ DB_PASSWORD="${DB_PASSWORD:-frappe_crm}"
 DB_NAME="${DB_NAME:-}"
 
 FRAPPE_BRANCH="${FRAPPE_BRANCH:-version-15}"
+
 CRM_REPO_URL="${CRM_REPO_URL:-https://github.com/frappe/crm}"
 CRM_REF="${CRM_REF:-main}"
+
+# WhatsApp (opcional)
+INSTALL_WHATSAPP="${INSTALL_WHATSAPP:-0}"
+WHATSAPP_REPO_URL="${WHATSAPP_REPO_URL:-https://github.com/shridarpatil/frappe_whatsapp}"
+WHATSAPP_REF="${WHATSAPP_REF:-main}"
 
 DEVELOPER_MODE="${DEVELOPER_MODE:-0}"
 MUTE_EMAILS="${MUTE_EMAILS:-1}"
@@ -160,6 +168,7 @@ bench_recreate_preserving_volumes() {
   bench_ok || { log "ERROR: bench still broken after venv rebuild."; exit 1; }
 }
 
+# >>> CORREÇÃO DA FALHA: não cria user, só garante DB
 ensure_db_db_exist_only() {
   log "Ensuring MariaDB database exists (no CREATE USER): db=${DB_NAME}"
 
@@ -221,12 +230,11 @@ PY
   bench new-site "${SITE_NAME}" \
     --force \
     --admin-password "${ADMIN_PASSWORD}" \
-    --db-root-username "${DB_ROOT_USERNAME}" \
-    --db-root-password "${DB_ROOT_PASSWORD}" \
     --db-host "${DB_HOST}" \
     --db-port "${DB_PORT}" \
     --db-name "${DB_NAME}" \
-    --mariadb-user-host-login-scope="%" \
+    --db-user "${DB_USER}" \
+    --db-password "${DB_PASSWORD}" \
     --no-mariadb-socket
 }
 
@@ -251,14 +259,15 @@ log "REDIS_SOCKETIO_URL=${REDIS_SOCKETIO_URL}"
 log "FRAPPE_BRANCH=${FRAPPE_BRANCH}"
 log "CRM_REPO_URL=${CRM_REPO_URL}"
 log "CRM_REF=${CRM_REF}"
+log "INSTALL_WHATSAPP=${INSTALL_WHATSAPP} WHATSAPP_REPO_URL=${WHATSAPP_REPO_URL} WHATSAPP_REF=${WHATSAPP_REF}"
 log "HTTP_PORT=${HTTP_PORT} SOCKETIO_PORT=${SOCKETIO_PORT}"
 log "GXP_MODE=${GXP_MODE} AUTO_REPAIR_SITE=${AUTO_REPAIR_SITE} PROTECT_IF_FILES=${PROTECT_IF_FILES} PROTECT_IF_DB_HAS_FILES=${PROTECT_IF_DB_HAS_FILES}"
 
 # ----------------------------
 # Wait deps (3 Redis + DB)
 # ----------------------------
-wait_tcp "$(redis_host_from_url "${REDIS_CACHE_URL}")"   "$(redis_port_from_url "${REDIS_CACHE_URL}")"   "Redis-Cache"
-wait_tcp "$(redis_host_from_url "${REDIS_QUEUE_URL}")"   "$(redis_port_from_url "${REDIS_QUEUE_URL}")"   "Redis-Queue"
+wait_tcp "$(redis_host_from_url "${REDIS_CACHE_URL}")"    "$(redis_port_from_url "${REDIS_CACHE_URL}")"    "Redis-Cache"
+wait_tcp "$(redis_host_from_url "${REDIS_QUEUE_URL}")"    "$(redis_port_from_url "${REDIS_QUEUE_URL}")"    "Redis-Queue"
 wait_tcp "$(redis_host_from_url "${REDIS_SOCKETIO_URL}")" "$(redis_port_from_url "${REDIS_SOCKETIO_URL}")" "Redis-SocketIO"
 wait_tcp "${DB_HOST}" "${DB_PORT}" "MariaDB"
 
@@ -299,31 +308,39 @@ sed -i '/redis/d' ./Procfile 2>/dev/null || true
 sed -i '/watch/d' ./Procfile 2>/dev/null || true
 
 # ----------------------------
-# App CRM
+# Get apps (idempotent)
 # ----------------------------
-if bench list-apps 2>/dev/null | grep -qx 'crm'; then
-  log "App crm already installed in bench."
+if [[ -d "${BENCH_DIR}/apps/crm" ]]; then
+  log "App crm already present in apps/."
 else
   log "Getting app crm..."
   bench get-app crm "${CRM_REPO_URL}" --branch "${CRM_REF}" --skip-assets
 fi
 
+if [[ "${INSTALL_WHATSAPP}" == "1" ]]; then
+  if [[ -d "${BENCH_DIR}/apps/frappe_whatsapp" ]]; then
+    log "App frappe_whatsapp already present in apps/."
+  else
+    log "Getting app frappe_whatsapp..."
+    bench get-app frappe_whatsapp "${WHATSAPP_REPO_URL}" --branch "${WHATSAPP_REF}" --skip-assets
+  fi
+fi
+
 # ----------------------------
 # DB ensure + Site create/validate/repair (GxP)
 # ----------------------------
-ensure_db_user_db_exist
+ensure_db_db_exist_only
 
 if ! site_exists; then
   log "Creating site ${SITE_NAME} (db=${DB_NAME})..."
   bench new-site "${SITE_NAME}" \
     --force \
     --admin-password "${ADMIN_PASSWORD}" \
-    --db-root-username "${DB_ROOT_USERNAME}" \
-    --db-root-password "${DB_ROOT_PASSWORD}" \
     --db-host "${DB_HOST}" \
     --db-port "${DB_PORT}" \
     --db-name "${DB_NAME}" \
-    --mariadb-user-host-login-scope="%" \
+    --db-user "${DB_USER}" \
+    --db-password "${DB_PASSWORD}" \
     --no-mariadb-socket
 else
   log "Site ${SITE_NAME} exists."
@@ -358,29 +375,42 @@ else
 fi
 
 # ----------------------------
-# Enforce DB config
+# Install apps on site (idempotent)
 # ----------------------------
-bench --site "${SITE_NAME}" set-config db_host "${DB_HOST}" || true
-bench --site "${SITE_NAME}" set-config db_port "${DB_PORT}" || true
-bench --site "${SITE_NAME}" set-config db_name "${DB_NAME}" || true
-bench --site "${SITE_NAME}" set-config db_user "${DB_USER}" || true
-bench --site "${SITE_NAME}" set-config db_password "${DB_PASSWORD}" || true
+needs_migrate=0
 
-log "Installing crm on site..."
-bench --site "${SITE_NAME}" install-app crm || true
+log "Installing crm on site (if needed)..."
+if bench --site "${SITE_NAME}" list-apps | grep -qx "crm"; then
+  log "crm already installed on site."
+else
+  bench --site "${SITE_NAME}" install-app crm
+  needs_migrate=1
+fi
 
+if [[ "${INSTALL_WHATSAPP}" == "1" ]]; then
+  log "Installing frappe_whatsapp on site (if needed)..."
+  if bench --site "${SITE_NAME}" list-apps | grep -qx "frappe_whatsapp"; then
+    log "frappe_whatsapp already installed on site."
+  else
+    bench --site "${SITE_NAME}" install-app frappe_whatsapp
+    needs_migrate=1
+  fi
+fi
+
+# configs
 bench --site "${SITE_NAME}" set-config developer_mode "${DEVELOPER_MODE}" || true
 bench --site "${SITE_NAME}" set-config mute_emails "${MUTE_EMAILS}" || true
 bench --site "${SITE_NAME}" set-config server_script_enabled "${SERVER_SCRIPT_ENABLED}" || true
 
 bench use "${SITE_NAME}" || true
 
-if [[ "${RUN_MIGRATE}" == "1" ]]; then
+# migrate/assets
+if [[ "${RUN_MIGRATE}" == "1" || "${needs_migrate}" == "1" ]]; then
   log "Running migrate..."
   bench --site "${SITE_NAME}" migrate
 fi
 
-if [[ "${RUN_BUILD_ASSETS}" == "1" ]]; then
+if [[ "${RUN_BUILD_ASSETS}" == "1" || "${needs_migrate}" == "1" ]]; then
   log "Building assets..."
   bench build --force
 fi
