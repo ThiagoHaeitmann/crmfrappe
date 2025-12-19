@@ -12,7 +12,7 @@ ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
 DB_HOST="${DB_HOST:-127.0.0.1}"
 DB_PORT="${DB_PORT:-3306}"
 
-# usuário "admin" do MariaDB que consegue criar DB/user (pode ser root ou teu frappe_crm com ALL)
+# usuário do MariaDB com permissão pra criar DB/user (pode ser root OU teu frappe_crm com ALL)
 DB_ROOT_USERNAME="${DB_ROOT_USERNAME:-root}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-123}"
 
@@ -41,8 +41,6 @@ SOCKETIO_PORT="${SOCKETIO_PORT:-9000}"
 # GxP controls
 GXP_MODE="${GXP_MODE:-1}"
 AUTO_REPAIR_SITE="${AUTO_REPAIR_SITE:-1}"
-
-# se existir qualquer evidência de arquivo/documento, NÃO reseta
 PROTECT_IF_FILES="${PROTECT_IF_FILES:-1}"
 PROTECT_IF_DB_HAS_FILES="${PROTECT_IF_DB_HAS_FILES:-1}"
 
@@ -112,6 +110,7 @@ PY
 }
 
 wipe_bench_keep_sites_logs() {
+  # não toca em sites/logs (volumes)
   find "${BENCH_DIR}" -mindepth 1 -maxdepth 1 \
     ! -name "sites" \
     ! -name "logs" \
@@ -128,7 +127,7 @@ bench_recreate_preserving_volumes() {
   log "bench init at ${tmp}"
   bench init --skip-redis-config-generation "${tmp}" --version "${FRAPPE_BRANCH}"
 
-  # NÃO copiar/mover env (venv não é relocatable)
+  # NÃO mover sites/logs/env (venv não é relocatable e sites/logs são volumes)
   rm -rf "${tmp}/sites" "${tmp}/logs" "${tmp}/env" 2>/dev/null || true
 
   log "Moving TMP bench into ${BENCH_DIR} (excluding sites/logs/env)..."
@@ -142,41 +141,51 @@ bench_recreate_preserving_volumes() {
   log "Rebuilding Python venv in FINAL bench path..."
   python3 -m venv "${BENCH_DIR}/env"
   "${BENCH_DIR}/env/bin/python" -m pip install --quiet --upgrade pip wheel
-
-  # reinstala frappe no venv FINAL (evita path do TMP)
   "${BENCH_DIR}/env/bin/python" -m pip install --quiet --upgrade -e "${BENCH_DIR}/apps/frappe"
 
-  # sanity check
-  if ! "${BENCH_DIR}/env/bin/python" -c "import frappe" >/dev/null 2>&1; then
+  "${BENCH_DIR}/env/bin/python" -c "import frappe" >/dev/null 2>&1 || {
     log "ERROR: venv rebuilt but 'import frappe' still fails."
     exit 1
-  fi
+  }
 
-  if ! bench_ok; then
+  bench_ok || {
     log "ERROR: bench still broken after venv rebuild."
     exit 1
-  fi
+  }
 }
 
+# --- DB ensure (FIXADO: heredoc QUOTED + env) ---
 ensure_db_user_db_exist() {
   log "Ensuring MariaDB database/user exist: db=${DB_NAME} user=${DB_USER}"
-  python3 - <<PY
-import pymysql
 
-host="${DB_HOST}"
-port=int("${DB_PORT}")
-root_user="${DB_ROOT_USERNAME}"
-root_pass="${DB_ROOT_PASSWORD}"
-db="${DB_NAME}"
-app_user="${DB_USER}"
-app_pass="${DB_PASSWORD}"
+  # valida identificador pra evitar injeção por env (GxP-friendly)
+  if ! [[ "${DB_NAME}" =~ ^[A-Za-z0-9_]+$ ]]; then
+    log "ERROR: DB_NAME inválido (use só letras/números/_). DB_NAME=${DB_NAME}"
+    exit 1
+  fi
+
+  DB_HOST="${DB_HOST}" DB_PORT="${DB_PORT}" \
+  DB_ROOT_USERNAME="${DB_ROOT_USERNAME}" DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD}" \
+  DB_NAME="${DB_NAME}" DB_USER="${DB_USER}" DB_PASSWORD="${DB_PASSWORD}" \
+  python3 - <<'PY'
+import os, pymysql
+
+host=os.environ["DB_HOST"]
+port=int(os.environ["DB_PORT"])
+root_user=os.environ["DB_ROOT_USERNAME"]
+root_pass=os.environ["DB_ROOT_PASSWORD"]
+db=os.environ["DB_NAME"]
+app_user=os.environ["DB_USER"]
+app_pass=os.environ["DB_PASSWORD"]
 
 conn = pymysql.connect(host=host, port=port, user=root_user, password=root_pass, autocommit=True)
 cur = conn.cursor()
-cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-cur.execute(f"CREATE USER IF NOT EXISTS '{app_user}'@'%' IDENTIFIED BY '{app_pass}'")
+
+cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+cur.execute(f"CREATE USER IF NOT EXISTS '{app_user}'@'%' IDENTIFIED BY %s", (app_pass,))
 cur.execute(f"GRANT ALL PRIVILEGES ON `{db}`.* TO '{app_user}'@'%'")
 cur.execute("FLUSH PRIVILEGES")
+
 cur.close()
 conn.close()
 print("DB ensured OK")
@@ -186,15 +195,24 @@ PY
 hard_reset_site_and_db() {
   log "AUTO-REPAIR: HARD RESET site+DB (no evidence of customer documents found)..."
 
-  python3 - <<PY
-import pymysql
-host="${DB_HOST}"; port=int("${DB_PORT}")
-root_user="${DB_ROOT_USERNAME}"; root_pass="${DB_ROOT_PASSWORD}"
-db="${DB_NAME}"
+  if ! [[ "${DB_NAME}" =~ ^[A-Za-z0-9_]+$ ]]; then
+    log "ERROR: DB_NAME inválido: ${DB_NAME}"
+    exit 1
+  fi
+
+  DB_HOST="${DB_HOST}" DB_PORT="${DB_PORT}" \
+  DB_ROOT_USERNAME="${DB_ROOT_USERNAME}" DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD}" \
+  DB_NAME="${DB_NAME}" \
+  python3 - <<'PY'
+import os, pymysql
+host=os.environ["DB_HOST"]; port=int(os.environ["DB_PORT"])
+root_user=os.environ["DB_ROOT_USERNAME"]; root_pass=os.environ["DB_ROOT_PASSWORD"]
+db=os.environ["DB_NAME"]
+
 conn=pymysql.connect(host=host, port=port, user=root_user, password=root_pass, autocommit=True)
 cur=conn.cursor()
 cur.execute(f"DROP DATABASE IF EXISTS `{db}`")
-cur.execute(f"CREATE DATABASE `{db}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+cur.execute(f"CREATE DATABASE `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
 cur.close(); conn.close()
 print("DB dropped+created OK")
 PY
@@ -294,7 +312,6 @@ else
   log "Site ${SITE_NAME} exists."
 fi
 
-# Se schema core tá quebrado: auto-repair só se NÃO tiver evidência de doc/dado
 if core_schema_ok; then
   log "Core schema OK."
 else
@@ -320,10 +337,7 @@ else
   log "GxP OK: no evidence of customer documents -> auto-repair allowed."
   hard_reset_site_and_db
 
-  if ! core_schema_ok; then
-    log "ERROR: core tables still missing after auto-repair"
-    exit 1
-  fi
+  core_schema_ok || { log "ERROR: core tables still missing after auto-repair"; exit 1; }
 fi
 
 # ----------------------------
