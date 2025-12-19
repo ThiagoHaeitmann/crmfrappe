@@ -160,21 +160,12 @@ bench_recreate_preserving_volumes() {
   bench_ok || { log "ERROR: bench still broken after venv rebuild."; exit 1; }
 }
 
-ensure_db_user_db_exist() {
-  log "Ensuring MariaDB database/user exist: db=${DB_NAME} user=${DB_USER}"
-
-  if ! [[ "${DB_NAME}" =~ ^[A-Za-z0-9_]+$ ]]; then
-    log "ERROR: DB_NAME inválido (use só letras/números/_). DB_NAME=${DB_NAME}"
-    exit 1
-  fi
-  if ! [[ "${DB_USER}" =~ ^[A-Za-z0-9_]+$ ]]; then
-    log "ERROR: DB_USER inválido (use só letras/números/_). DB_USER=${DB_USER}"
-    exit 1
-  fi
+ensure_db_db_exist_only() {
+  log "Ensuring MariaDB database exists (no CREATE USER): db=${DB_NAME}"
 
   DB_HOST="${DB_HOST}" DB_PORT="${DB_PORT}" \
   DB_ROOT_USERNAME="${DB_ROOT_USERNAME}" DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD}" \
-  DB_NAME="${DB_NAME}" DB_USER="${DB_USER}" DB_PASSWORD="${DB_PASSWORD}" \
+  DB_NAME="${DB_NAME}" \
   python3 - <<'PY'
 import os, sys
 try:
@@ -189,17 +180,12 @@ port=int(os.environ["DB_PORT"])
 root_user=os.environ["DB_ROOT_USERNAME"]
 root_pass=os.environ["DB_ROOT_PASSWORD"]
 db=os.environ["DB_NAME"]
-app_user=os.environ["DB_USER"]
-app_pass=os.environ["DB_PASSWORD"]
 
 conn = pymysql.connect(host=host, port=port, user=root_user, password=root_pass, autocommit=True)
 cur = conn.cursor()
 cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-cur.execute("CREATE USER IF NOT EXISTS %s@%s IDENTIFIED BY %s", (app_user, "%", app_pass))
-cur.execute(f"GRANT ALL PRIVILEGES ON `{db}`.* TO %s@%s", (app_user, "%"))
-cur.execute("FLUSH PRIVILEGES")
 cur.close(); conn.close()
-print("DB ensured OK")
+print("DB ensured OK (no user creation)")
 PY
 }
 
