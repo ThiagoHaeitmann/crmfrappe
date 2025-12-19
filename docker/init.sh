@@ -154,13 +154,20 @@ bench_recreate_preserving_volumes() {
   }
 }
 
-# --- DB ensure (FIXADO: heredoc QUOTED + env) ---
+# ----------------------------
+# DB ensure (FIXADO: % + pymysql + validação)
+# ----------------------------
 ensure_db_user_db_exist() {
   log "Ensuring MariaDB database/user exist: db=${DB_NAME} user=${DB_USER}"
 
-  # valida identificador pra evitar injeção por env (GxP-friendly)
+  # valida identificadores pra evitar injeção por env (GxP-friendly)
   if ! [[ "${DB_NAME}" =~ ^[A-Za-z0-9_]+$ ]]; then
     log "ERROR: DB_NAME inválido (use só letras/números/_). DB_NAME=${DB_NAME}"
+    exit 1
+  fi
+
+  if ! [[ "${DB_USER}" =~ ^[A-Za-z0-9_]+$ ]]; then
+    log "ERROR: DB_USER inválido (use só letras/números/_). DB_USER=${DB_USER}"
     exit 1
   fi
 
@@ -168,7 +175,15 @@ ensure_db_user_db_exist() {
   DB_ROOT_USERNAME="${DB_ROOT_USERNAME}" DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD}" \
   DB_NAME="${DB_NAME}" DB_USER="${DB_USER}" DB_PASSWORD="${DB_PASSWORD}" \
   python3 - <<'PY'
-import os, pymysql
+import os, sys
+
+# garante pymysql (evita falha boba)
+try:
+    import pymysql
+except Exception:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "pymysql"])
+    import pymysql
 
 host=os.environ["DB_HOST"]
 port=int(os.environ["DB_PORT"])
@@ -182,8 +197,11 @@ conn = pymysql.connect(host=host, port=port, user=root_user, password=root_pass,
 cur = conn.cursor()
 
 cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-cur.execute(f"CREATE USER IF NOT EXISTS '{app_user}'@'%' IDENTIFIED BY %s", (app_pass,))
-cur.execute(f"GRANT ALL PRIVILEGES ON `{db}`.* TO '{app_user}'@'%'")
+
+# ✅ FIX REAL: nada de "@'%'" literal junto com parâmetros (PyMySQL quebra)
+cur.execute("CREATE USER IF NOT EXISTS %s@%s IDENTIFIED BY %s", (app_user, "%", app_pass))
+cur.execute(f"GRANT ALL PRIVILEGES ON `{db}`.* TO %s@%s", (app_user, "%"))
+
 cur.execute("FLUSH PRIVILEGES")
 
 cur.close()
@@ -204,7 +222,15 @@ hard_reset_site_and_db() {
   DB_ROOT_USERNAME="${DB_ROOT_USERNAME}" DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD}" \
   DB_NAME="${DB_NAME}" \
   python3 - <<'PY'
-import os, pymysql
+import os, sys
+
+try:
+    import pymysql
+except Exception:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "pymysql"])
+    import pymysql
+
 host=os.environ["DB_HOST"]; port=int(os.environ["DB_PORT"])
 root_user=os.environ["DB_ROOT_USERNAME"]; root_pass=os.environ["DB_ROOT_PASSWORD"]
 db=os.environ["DB_NAME"]
