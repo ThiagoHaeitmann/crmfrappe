@@ -12,17 +12,12 @@ ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
 DB_HOST="${DB_HOST:-127.0.0.1}"
 DB_PORT="${DB_PORT:-3306}"
 
-# usuário do MariaDB com permissão pra criar DB/user (pode ser root OU teu frappe_crm com ALL)
 DB_ROOT_USERNAME="${DB_ROOT_USERNAME:-root}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-123}"
 
 DB_USER="${DB_USER:-frappe_crm}"
 DB_PASSWORD="${DB_PASSWORD:-frappe_crm}"
 DB_NAME="${DB_NAME:-}"
-
-REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
-REDIS_PORT="${REDIS_PORT:-6379}"
-REDIS_URL="${REDIS_URL:-redis://${REDIS_HOST}:${REDIS_PORT}}"
 
 FRAPPE_BRANCH="${FRAPPE_BRANCH:-version-15}"
 CRM_REPO_URL="${CRM_REPO_URL:-https://github.com/frappe/crm}"
@@ -37,6 +32,20 @@ RUN_BUILD_ASSETS="${RUN_BUILD_ASSETS:-1}"
 
 HTTP_PORT="${HTTP_PORT:-8000}"
 SOCKETIO_PORT="${SOCKETIO_PORT:-9000}"
+
+# 3 redis URLs (novos)
+REDIS_CACHE_URL="${REDIS_CACHE_URL:-}"
+REDIS_QUEUE_URL="${REDIS_QUEUE_URL:-}"
+REDIS_SOCKETIO_URL="${REDIS_SOCKETIO_URL:-}"
+
+# fallback compat (se você ainda setar REDIS_HOST/REDIS_PORT antigo)
+REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
+REDIS_PORT="${REDIS_PORT:-6379}"
+REDIS_URL="${REDIS_URL:-redis://${REDIS_HOST}:${REDIS_PORT}}"
+
+if [[ -z "${REDIS_CACHE_URL}" ]]; then REDIS_CACHE_URL="${REDIS_URL}"; fi
+if [[ -z "${REDIS_QUEUE_URL}" ]]; then REDIS_QUEUE_URL="${REDIS_URL}"; fi
+if [[ -z "${REDIS_SOCKETIO_URL}" ]]; then REDIS_SOCKETIO_URL="${REDIS_URL}"; fi
 
 # GxP controls
 GXP_MODE="${GXP_MODE:-1}"
@@ -64,6 +73,10 @@ wait_tcp() {
   return 1
 }
 
+# parse redis://host:port
+redis_host_from_url(){ echo "$1" | sed -E 's#^redis://([^:/]+).*#\1#'; }
+redis_port_from_url(){ echo "$1" | sed -E 's#.*:([0-9]+)$#\1#'; }
+
 bench_ok() {
   [[ -f "${BENCH_DIR}/Procfile" ]] || return 1
   [[ -d "${BENCH_DIR}/apps/frappe" ]] || return 1
@@ -77,9 +90,7 @@ ensure_sites_logs() {
   [[ -f "${BENCH_DIR}/sites/common_site_config.json" ]] || echo "{}" > "${BENCH_DIR}/sites/common_site_config.json"
 }
 
-site_exists() {
-  [[ -d "${BENCH_DIR}/sites/${SITE_NAME}" ]]
-}
+site_exists() { [[ -d "${BENCH_DIR}/sites/${SITE_NAME}" ]]; }
 
 site_has_files_on_disk() {
   local pub="${BENCH_DIR}/sites/${SITE_NAME}/public/files"
@@ -110,7 +121,6 @@ PY
 }
 
 wipe_bench_keep_sites_logs() {
-  # não toca em sites/logs (volumes)
   find "${BENCH_DIR}" -mindepth 1 -maxdepth 1 \
     ! -name "sites" \
     ! -name "logs" \
@@ -127,7 +137,6 @@ bench_recreate_preserving_volumes() {
   log "bench init at ${tmp}"
   bench init --skip-redis-config-generation "${tmp}" --version "${FRAPPE_BRANCH}"
 
-  # NÃO mover sites/logs/env (venv não é relocatable e sites/logs são volumes)
   rm -rf "${tmp}/sites" "${tmp}/logs" "${tmp}/env" 2>/dev/null || true
 
   log "Moving TMP bench into ${BENCH_DIR} (excluding sites/logs/env)..."
@@ -148,24 +157,16 @@ bench_recreate_preserving_volumes() {
     exit 1
   }
 
-  bench_ok || {
-    log "ERROR: bench still broken after venv rebuild."
-    exit 1
-  }
+  bench_ok || { log "ERROR: bench still broken after venv rebuild."; exit 1; }
 }
 
-# ----------------------------
-# DB ensure (FIXADO: % + pymysql + validação)
-# ----------------------------
 ensure_db_user_db_exist() {
   log "Ensuring MariaDB database/user exist: db=${DB_NAME} user=${DB_USER}"
 
-  # valida identificadores pra evitar injeção por env (GxP-friendly)
   if ! [[ "${DB_NAME}" =~ ^[A-Za-z0-9_]+$ ]]; then
     log "ERROR: DB_NAME inválido (use só letras/números/_). DB_NAME=${DB_NAME}"
     exit 1
   fi
-
   if ! [[ "${DB_USER}" =~ ^[A-Za-z0-9_]+$ ]]; then
     log "ERROR: DB_USER inválido (use só letras/números/_). DB_USER=${DB_USER}"
     exit 1
@@ -176,8 +177,6 @@ ensure_db_user_db_exist() {
   DB_NAME="${DB_NAME}" DB_USER="${DB_USER}" DB_PASSWORD="${DB_PASSWORD}" \
   python3 - <<'PY'
 import os, sys
-
-# garante pymysql (evita falha boba)
 try:
     import pymysql
 except Exception:
@@ -195,17 +194,11 @@ app_pass=os.environ["DB_PASSWORD"]
 
 conn = pymysql.connect(host=host, port=port, user=root_user, password=root_pass, autocommit=True)
 cur = conn.cursor()
-
 cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-
-# ✅ FIX REAL: nada de "@'%'" literal junto com parâmetros (PyMySQL quebra)
 cur.execute("CREATE USER IF NOT EXISTS %s@%s IDENTIFIED BY %s", (app_user, "%", app_pass))
 cur.execute(f"GRANT ALL PRIVILEGES ON `{db}`.* TO %s@%s", (app_user, "%"))
-
 cur.execute("FLUSH PRIVILEGES")
-
-cur.close()
-conn.close()
+cur.close(); conn.close()
 print("DB ensured OK")
 PY
 }
@@ -213,17 +206,11 @@ PY
 hard_reset_site_and_db() {
   log "AUTO-REPAIR: HARD RESET site+DB (no evidence of customer documents found)..."
 
-  if ! [[ "${DB_NAME}" =~ ^[A-Za-z0-9_]+$ ]]; then
-    log "ERROR: DB_NAME inválido: ${DB_NAME}"
-    exit 1
-  fi
-
   DB_HOST="${DB_HOST}" DB_PORT="${DB_PORT}" \
   DB_ROOT_USERNAME="${DB_ROOT_USERNAME}" DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD}" \
   DB_NAME="${DB_NAME}" \
   python3 - <<'PY'
 import os, sys
-
 try:
     import pymysql
 except Exception:
@@ -266,14 +253,15 @@ if ! mkdir "${LOCKDIR}" 2>/dev/null; then
 fi
 trap 'rmdir "${LOCKDIR}" 2>/dev/null || true' EXIT
 
-# DB_NAME default
 if [[ -z "${DB_NAME}" ]]; then
   DB_NAME="$(echo "${SITE_NAME}" | tr '.' '_' | tr -cd 'a-zA-Z0-9_')"
 fi
 
 log "SITE_NAME=${SITE_NAME}"
 log "DB=${DB_HOST}:${DB_PORT} root=${DB_ROOT_USERNAME} app_user=${DB_USER} db=${DB_NAME}"
-log "REDIS=${REDIS_URL}"
+log "REDIS_CACHE_URL=${REDIS_CACHE_URL}"
+log "REDIS_QUEUE_URL=${REDIS_QUEUE_URL}"
+log "REDIS_SOCKETIO_URL=${REDIS_SOCKETIO_URL}"
 log "FRAPPE_BRANCH=${FRAPPE_BRANCH}"
 log "CRM_REPO_URL=${CRM_REPO_URL}"
 log "CRM_REF=${CRM_REF}"
@@ -281,9 +269,11 @@ log "HTTP_PORT=${HTTP_PORT} SOCKETIO_PORT=${SOCKETIO_PORT}"
 log "GXP_MODE=${GXP_MODE} AUTO_REPAIR_SITE=${AUTO_REPAIR_SITE} PROTECT_IF_FILES=${PROTECT_IF_FILES} PROTECT_IF_DB_HAS_FILES=${PROTECT_IF_DB_HAS_FILES}"
 
 # ----------------------------
-# Wait deps
+# Wait deps (3 Redis + DB)
 # ----------------------------
-wait_tcp "127.0.0.1" "${REDIS_PORT}" "Redis"
+wait_tcp "$(redis_host_from_url "${REDIS_CACHE_URL}")"   "$(redis_port_from_url "${REDIS_CACHE_URL}")"   "Redis-Cache"
+wait_tcp "$(redis_host_from_url "${REDIS_QUEUE_URL}")"   "$(redis_port_from_url "${REDIS_QUEUE_URL}")"   "Redis-Queue"
+wait_tcp "$(redis_host_from_url "${REDIS_SOCKETIO_URL}")" "$(redis_port_from_url "${REDIS_SOCKETIO_URL}")" "Redis-SocketIO"
 wait_tcp "${DB_HOST}" "${DB_PORT}" "MariaDB"
 
 # ----------------------------
@@ -296,13 +286,28 @@ fi
 cd "${BENCH_DIR}"
 
 # ----------------------------
+# Write common_site_config.json (3 redis)
+# ----------------------------
+log "Writing sites/common_site_config.json"
+cat > "${BENCH_DIR}/sites/common_site_config.json" <<JSON
+{
+  "db_host": "${DB_HOST}",
+  "db_port": ${DB_PORT},
+  "redis_cache": "${REDIS_CACHE_URL}",
+  "redis_queue": "${REDIS_QUEUE_URL}",
+  "redis_socketio": "${REDIS_SOCKETIO_URL}",
+  "socketio_port": ${SOCKETIO_PORT}
+}
+JSON
+
+# ----------------------------
 # Configure endpoints (idempotent)
 # ----------------------------
 log "Configuring DB/Redis endpoints..."
 bench set-mariadb-host "${DB_HOST}" || true
-bench set-redis-cache-host "${REDIS_URL}" || true
-bench set-redis-queue-host "${REDIS_URL}" || true
-bench set-redis-socketio-host "${REDIS_URL}" || true
+bench set-redis-cache-host "${REDIS_CACHE_URL}" || true
+bench set-redis-queue-host "${REDIS_QUEUE_URL}" || true
+bench set-redis-socketio-host "${REDIS_SOCKETIO_URL}" || true
 
 sed -i '/redis/d' ./Procfile 2>/dev/null || true
 sed -i '/watch/d' ./Procfile 2>/dev/null || true
@@ -367,7 +372,7 @@ else
 fi
 
 # ----------------------------
-# Enforce DB config (deterministic)
+# Enforce DB config
 # ----------------------------
 bench --site "${SITE_NAME}" set-config db_host "${DB_HOST}" || true
 bench --site "${SITE_NAME}" set-config db_port "${DB_PORT}" || true
